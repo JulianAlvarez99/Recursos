@@ -55,7 +55,12 @@ class TelemetryLogger:
             database=os.getenv("DB_NAME"),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASS"),
-            port=os.getenv("DB_PORT")
+            port=os.getenv("DB_PORT"),
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=15,
+            keepalives_interval=10,
+            keepalives_count=5
         )
 
     def _init_lhm(self):
@@ -183,6 +188,8 @@ class TelemetryLogger:
 
         logger.info(f"Iniciando captura de telemetria en tabla {self.table_name} (Intervalo: {self.update_time}s)...")
         
+        fallos_consecutivos = 0
+
         try:
             while True:
                 try:
@@ -212,26 +219,25 @@ class TelemetryLogger:
                         # Info está bien para saber que está vivo.
                         logger.info(f"OK: {len(to_db)} datos insertados correctamente.")
 
+                    fallos_consecutivos = 0
                     time.sleep(self.update_time)
 
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                    logger.error(f"Error de conexión a PostgreSQL detectado: {e}")
-                    self._reconnect_db()
                 except Exception as e:
-                    # Verificar si la conexión sigue viva; si no, reconectar
-                    try:
-                        if self.conn.closed:
-                            raise psycopg2.InterfaceError("Conexión cerrada detectada en handler genérico")
-                        # Test rápido de conexión
-                        with self.conn.cursor() as cur:
-                            cur.execute("SELECT 1")
-                    except Exception:
-                        logger.error(f"Error inesperado con conexión caída: {e}", exc_info=True)
-                        self._reconnect_db()
-                        continue
+                    fallos_consecutivos += 1
+                    is_connection_error = isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError))
                     
-                    logger.error(f"Error inesperado durante el ciclo de captura: {e}", exc_info=True)
-                    time.sleep(60)
+                    if is_connection_error:
+                        logger.error(f"Error crítico de conexión detectado: {e}")
+                        self._reconnect_db()
+                        fallos_consecutivos = 0
+                    else:
+                        logger.error(f"Error inesperado durante captura (Fallo {fallos_consecutivos}/3): {e}", exc_info=True)
+                        if fallos_consecutivos >= 3:
+                            logger.error("Se superó el límite de 3 fallos consecutivos. Forzando cierre y reconexión de BD...")
+                            self._reconnect_db()
+                            fallos_consecutivos = 0
+                        else:
+                            time.sleep(self.update_time)
 
         except KeyboardInterrupt:
             logger.info("Deteniendo captura de telemetria por orden del usuario (Ctrl+C).")
