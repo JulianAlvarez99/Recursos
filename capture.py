@@ -1,6 +1,8 @@
 import os
 import clr
 import time
+import threading
+from queue import Queue, Empty
 import psycopg2
 from psycopg2 import extras
 from datetime import datetime
@@ -39,6 +41,24 @@ dll_path = os.path.join(os.getcwd(), 'LibreHardwareMonitorLib.dll')
 clr.AddReference(dll_path)
 from LibreHardwareMonitor.Hardware import Computer
 
+# Mapeo constante de tipos de hardware LHM → tipos de la BD
+LHM_TO_DB_HW = {
+    "Cpu": "CPU", "GpuNvidia": "GPU", "GpuAti": "GPU",
+    "Motherboard": "MOTHERBOARD", "SuperIO": "MOTHERBOARD",
+    "Memory": "MEMORIA RAM", "Storage": "ALMACENAMIENTO"
+}
+
+# Patrones regex para auto-registro de sensores dinámicos (pre-compilados)
+DYNAMIC_REGEX = [
+    (re.compile(r'^CPU Core #\d+$', re.IGNORECASE),     'temperature'),
+    (re.compile(r'^CPU Core #\d+$', re.IGNORECASE),     'load'),
+    (re.compile(r'^CPU Core #\d+$', re.IGNORECASE),     'power'),
+    (re.compile(r'^System Fan #\d+.*$', re.IGNORECASE), 'fan'),
+    (re.compile(r'^CPU Fan.*$', re.IGNORECASE),          'fan'),
+    (re.compile(r'^GPU Fan #\d+.*$', re.IGNORECASE),     'fan'),
+]
+
+
 class TelemetryLogger:
     def __init__(self):
         self.table_name = os.getenv("CLIENT_TABLE_NAME")
@@ -47,12 +67,30 @@ class TelemetryLogger:
         self.pc = self._init_lhm()
         self.cache_hw = {}
         self.cache_sensor = {}
+        self.dynamic_patterns = []
+
+        # 1. Cargar metadata de la BD (componentes y sensores)
         self._load_metadata_cache()
 
+        # 2. Descubrir todos los sensores del hardware y pre-resolver sus IDs
+        self.sensor_plan = self._build_sensor_plan()
+
+        # 3. Cola thread-safe para comunicación Productor → Consumidor
+        #    maxsize=5 para evitar acumulación excesiva si la BD se atrasa
+        self._data_queue = Queue(maxsize=5)
+
+        # 4. Evento para señalizar apagado limpio de hilos
+        self._stop_event = threading.Event()
+
+    # ─── Conexión y configuración ──────────────────────────────────────
+
     def _connect_to_db(self):
-        return psycopg2.connect(
-            host=os.getenv("DB_HOST"),
-            database=os.getenv("DB_NAME"),
+        host = os.getenv("DB_HOST")
+        db   = os.getenv("DB_NAME")
+        logger.info(f"Conectando a la base de datos '{db}' en {host}...")
+        conn = psycopg2.connect(
+            host=host,
+            database=db,
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASS"),
             port=os.getenv("DB_PORT"),
@@ -62,8 +100,11 @@ class TelemetryLogger:
             keepalives_interval=10,
             keepalives_count=5
         )
+        logger.info(f"Conexión establecida con '{db}' en {host}.")
+        return conn
 
     def _init_lhm(self):
+        logger.info("Inicializando LibreHardwareMonitor...")
         c = Computer()
         c.IsCpuEnabled = True
         c.IsGpuEnabled = True
@@ -75,7 +116,10 @@ class TelemetryLogger:
         c.Open()
         return c
 
+    # ─── Carga de metadata y resolución de sensores ────────────────────
+
     def _load_metadata_cache(self):
+        """Carga la tabla Componente y Sensor de la BD en memoria."""
         try:
             with self.conn.cursor() as cur:
                 cur.execute("SELECT hardware_id, hardware_type FROM Componente")
@@ -93,32 +137,32 @@ class TelemetryLogger:
                 if '%' in sensor_name:
                     self.dynamic_patterns.append((sensor_name.upper(), sensor_type.upper(), sensor_id))
 
-            logger.info(f"Cache sincronizada con BD: {len(self.cache_sensor)} sensores conocidos.")
+            logger.info(
+                f"Cache cargada: {len(self.cache_hw)} componentes, "
+                f"{len(self.cache_sensor)} sensores "
+                f"({len(self.dynamic_patterns)} con patrón wildcard)."
+            )
         except Exception as e:
-            logger.error(f"Error cargando la cache de la base de datos: {e}")
+            logger.error(f"Error cargando la cache de la base de datos: {e}", exc_info=True)
 
     def _resolve_sensor_id(self, s_name: str, s_type: str) -> int | None:
+        """Resuelve el sensor_id. Se ejecuta una sola vez por sensor en _build_sensor_plan."""
         key = (s_name.upper(), s_type.upper())
 
+        # 1. Coincidencia exacta en cache
         if key in self.cache_sensor:
             return self.cache_sensor[key]
 
+        # 2. Coincidencia por patrón wildcard (%) de la BD
         for pat_name, pat_type, pat_id in self.dynamic_patterns:
             if pat_type == s_type.upper() and fnmatch.fnmatch(s_name.upper(), pat_name):
                 self.cache_sensor[key] = pat_id
                 return pat_id
 
-        DYNAMIC_REGEX = [
-            (r'^CPU Core #\d+$',   'Temperature'),
-            (r'^CPU Core #\d+$',   'Load'),
-            (r'^CPU Core #\d+$',   'Power'),
-            (r'^System Fan #\d+.*$', 'Fan'),
-            (r'^CPU Fan.*$',       'Fan'),
-            (r'^GPU Fan #\d+.*$',  'Fan'),
-        ]
-        
-        for pattern, expected_type in DYNAMIC_REGEX:
-            if s_type.lower() == expected_type.lower() and re.match(pattern, s_name, re.IGNORECASE):
+        # 3. Auto-registro si coincide con un patrón regex conocido
+        s_type_lower = s_type.lower()
+        for compiled_re, expected_type in DYNAMIC_REGEX:
+            if s_type_lower == expected_type and compiled_re.match(s_name):
                 try:
                     with self.conn.cursor() as cur:
                         cur.execute(
@@ -132,7 +176,7 @@ class TelemetryLogger:
                         else:
                             cur.execute("SELECT sensor_id FROM Sensor WHERE sensor_name=%s AND sensor_type=%s", (s_name, s_type))
                             new_id = cur.fetchone()[0]
-                            
+
                         self.conn.commit()
                     self.cache_sensor[key] = new_id
                     logger.info(f"Sensor dinámico auto-registrado: {s_name} ({s_type}) → id={new_id}")
@@ -144,108 +188,210 @@ class TelemetryLogger:
 
         return None
 
-    def _get_sensors_recursive(self, hardware_list):
-        data = []
-        for hw in hardware_list:
+    def _collect_all_hardware(self):
+        """Recorre iterativamente todo el árbol de hardware y devuelve una lista plana
+        de (hw_object, lhm_type_str, db_hw_type_upper)."""
+        result = []
+        stack = list(self.pc.Hardware)
+        while stack:
+            hw = stack.pop()
+            lhm_type = str(hw.HardwareType)
+            db_hw_type = LHM_TO_DB_HW.get(lhm_type, "").upper()
+            result.append((hw, lhm_type, db_hw_type))
+            sub = list(hw.SubHardware)
+            if sub:
+                stack.extend(sub)
+        return result
+
+    def _build_sensor_plan(self):
+        """Se ejecuta una sola vez al inicio. Descubre todos los sensores del hardware,
+        resuelve sus IDs, y devuelve una lista de tuplas listas para el loop:
+        [(hw_object, hardware_name, hardware_id, sensor_object, sensor_id), ...]
+
+        Los sensores que no resuelven ID se descartan aquí y no se vuelven a evaluar."""
+        logger.info("Construyendo plan de sensores (resolución única de IDs)...")
+
+        hw_list = self._collect_all_hardware()
+        for hw, _, _ in hw_list:
             hw.Update()
+
+        plan = []
+        skipped = 0
+
+        for hw, lhm_hw_type, db_hw_type in hw_list:
+            h_id = self.cache_hw.get(db_hw_type)
+            if h_id is None:
+                continue
+
+            hw_name = str(hw.Name)
+
             for s in hw.Sensors:
-                data.append((str(hw.HardwareType), str(hw.Name), s.Name, str(s.SensorType), s.Value))
-            if list(hw.SubHardware):
-                data.extend(self._get_sensors_recursive(hw.SubHardware))
-        return data
+                s_name = s.Name
+                s_type = str(s.SensorType)
+
+                # Rename "Memory" → "Virtual Memory" para sensores de RAM virtual
+                resolved_name = "Virtual Memory" if (s_name == "Memory" and "Virtual Memory" in hw_name) else s_name
+
+                s_id = self._resolve_sensor_id(resolved_name, s_type)
+                if s_id is None:
+                    skipped += 1
+                    logger.debug(f"Sensor descartado (sin ID en BD): '{resolved_name}' tipo '{s_type}' en '{hw_name}'")
+                    continue
+
+                plan.append((hw, hw_name, h_id, s, s_id))
+
+        logger.info(f"Plan de sensores construido: {len(plan)} sensores activos, {skipped} descartados sin ID en BD.")
+        return plan
+
+    # ─── Reconexión ────────────────────────────────────────────────────
 
     def _reconnect_db(self):
         """Intenta reconectar a la base de datos indefinidamente."""
-        logger.warning("Conexion perdida con la base de datos. Intentando reconectar...")
+        logger.critical("Conexión perdida con la base de datos. Iniciando ciclo de reconexión...")
         attempt = 0
-        while True:
+        while not self._stop_event.is_set():
             attempt += 1
             try:
-                # Cerrar conexión anterior de forma segura
                 try:
                     if self.conn and not self.conn.closed:
                         self.conn.close()
+                        logger.debug("Conexión anterior cerrada correctamente antes de reconectar.")
                 except Exception:
-                    pass  # Ignorar errores al cerrar conexión rota
-                
+                    pass
+
                 self.conn = self._connect_to_db()
                 self._load_metadata_cache()
                 logger.info(f"Reconexión exitosa a la base de datos (intento #{attempt}).")
                 break
             except (psycopg2.OperationalError, psycopg2.InterfaceError, OSError, ConnectionError) as e:
-                logger.warning(f"Fallo al reconectar (intento #{attempt}): {e}. Reintentando en 60 segundos...")
-                time.sleep(60)
+                logger.warning(f"Reconexión fallida (intento #{attempt}): {e}. Reintentando en 60s...")
+                self._stop_event.wait(timeout=60)
             except Exception as e:
-                logger.error(f"Error inesperado durante reconexión (intento #{attempt}): {e}. Reintentando en 60 segundos...")
-                time.sleep(60)
+                logger.error(f"Error inesperado durante reconexión (intento #{attempt}): {e}. Reintentando en 60s...", exc_info=True)
+                self._stop_event.wait(timeout=60)
 
-    def run(self):
-        LHM_TO_DB_HW = {
-            "Cpu": "CPU", "GpuNvidia": "GPU", "GpuAti": "GPU",
-            "Motherboard": "MOTHERBOARD", "SuperIO": "MOTHERBOARD",
-            "Memory": "MEMORIA RAM", "Storage": "ALMACENAMIENTO"
-        }
+    # ─── Hilo Productor: captura de sensores ───────────────────────────
 
-        logger.info(f"Iniciando captura de telemetria en tabla {self.table_name} (Intervalo: {self.update_time}s)...")
-        
+    def _producer_loop(self):
+        """Hilo dedicado a la lectura de hardware.
+        Captura timestamp → actualiza hardware → lee valores → pone batch en la cola."""
+        logger.info("Hilo productor de sensores iniciado.")
+
+        # Pre-calcular el set de objetos hw únicos para evitar recálculo cada ciclo
+        unique_hw = []
+        seen = set()
+        for hw, _, _, _, _ in self.sensor_plan:
+            obj_id = id(hw)
+            if obj_id not in seen:
+                unique_hw.append(hw)
+                seen.add(obj_id)
+
+        while not self._stop_event.is_set():
+            try:
+                # 1. Capturar timestamp al inicio de la lectura
+                now = datetime.now()
+
+                # 2. Actualizar cada hardware una sola vez
+                for hw in unique_hw:
+                    hw.Update()
+
+                # 3. Leer valores del plan pre-resuelto
+                batch = []
+                for _, hw_name, h_id, sensor, s_id in self.sensor_plan:
+                    val = float(sensor.Value) if sensor.Value is not None else 0.0
+                    batch.append((now, h_id, s_id, hw_name, val))
+
+                # 4. Enviar batch a la cola (bloquea si la cola está llena)
+                if batch:
+                    self._data_queue.put(batch)
+                else:
+                    logger.warning("Productor generó un batch vacío; ningún sensor activo reportó valores.")
+
+            except Exception as e:
+                logger.error(f"Error en hilo productor durante la captura de sensores: {e}", exc_info=True)
+
+            # Esperar el intervalo, pero interrumpible por stop_event
+            self._stop_event.wait(timeout=self.update_time)
+
+        logger.info("Hilo productor finalizado.")
+
+    # ─── Hilo Principal (Consumidor): inserción en BD ──────────────────
+
+    def _consumer_loop(self):
+        """Loop principal: toma batches de la cola e inserta en la BD.
+        queue.get() bloquea hasta que el productor deposita datos → sincronización natural."""
+        insert_query = f"INSERT INTO {self.table_name} (timestamp, hardware_id, sensor_id, hardware_name, value) VALUES %s"
         fallos_consecutivos = 0
 
-        try:
-            while True:
+        while not self._stop_event.is_set():
+            # --- Esperar datos del productor (con timeout para poder chequear stop_event) ---
+            try:
+                batch = self._data_queue.get(timeout=self.update_time * 2)
+            except Empty:
+                logger.debug("Consumidor: timeout esperando datos del productor (posible retraso o inactividad).")
+                continue
+
+            # --- Insertar en la BD ---
+            try:
+                with self.conn.cursor() as cur:
+                    extras.execute_values(cur, insert_query, batch)
+                    self.conn.commit()
+
+                logger.info(f"Inserción OK: {len(batch)} registros insertados en '{self.table_name}'.")
+                fallos_consecutivos = 0
+
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                logger.critical(f"Error de conexión con la BD durante inserción: {e}")
+                self._reconnect_db()
+                fallos_consecutivos = 0
+                # Reintentar insertar el batch perdido tras reconectar
+                logger.info("Reintentando inserción del batch pendiente tras reconexión...")
                 try:
-                    now = datetime.now()
-                    raw_sensors = self._get_sensors_recursive(self.pc.Hardware)
-                    to_db = []
+                    with self.conn.cursor() as cur:
+                        extras.execute_values(cur, insert_query, batch)
+                        self.conn.commit()
+                    logger.info(f"Batch pendiente re-insertado correctamente ({len(batch)} registros).")
+                except Exception as retry_e:
+                    logger.error(f"Fallo al re-insertar batch pendiente tras reconexión: {retry_e}", exc_info=True)
 
-                    for lhm_hw_type, lhm_hw_name, s_name, s_type, s_val in raw_sensors:
-                        if s_name == "Memory" and "Virtual Memory" in lhm_hw_name:
-                            s_name = "Virtual Memory"
-
-                        db_hw_type = LHM_TO_DB_HW.get(lhm_hw_type, "").upper()
-                        h_id = self.cache_hw.get(db_hw_type)
-                        s_id = self._resolve_sensor_id(s_name, s_type)
-
-                        if h_id is not None and s_id is not None:
-                            val = float(s_val) if s_val is not None else 0.0
-                            to_db.append((now, h_id, s_id, lhm_hw_name, val))
-
-                    if to_db:
-                        with self.conn.cursor() as cur:
-                            query = f"INSERT INTO {self.table_name} (timestamp, hardware_id, sensor_id, hardware_name, value) VALUES %s"
-                            extras.execute_values(cur, query, to_db)
-                            self.conn.commit()
-                        
-                        # Usamos DEBUG o INFO según qué tan ruidoso quieras el log. 
-                        # Info está bien para saber que está vivo.
-                        logger.info(f"OK: {len(to_db)} datos insertados correctamente.")
-
+            except Exception as e:
+                fallos_consecutivos += 1
+                logger.error(f"Error inesperado durante inserción (fallo {fallos_consecutivos}/3): {e}", exc_info=True)
+                if fallos_consecutivos >= 3:
+                    logger.critical("Límite de 3 fallos consecutivos alcanzado. Forzando reconexión a la BD...")
+                    self._reconnect_db()
                     fallos_consecutivos = 0
-                    time.sleep(self.update_time)
 
-                except Exception as e:
-                    fallos_consecutivos += 1
-                    is_connection_error = isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError))
-                    
-                    if is_connection_error:
-                        logger.error(f"Error crítico de conexión detectado: {e}")
-                        self._reconnect_db()
-                        fallos_consecutivos = 0
-                    else:
-                        logger.error(f"Error inesperado durante captura (Fallo {fallos_consecutivos}/3): {e}", exc_info=True)
-                        if fallos_consecutivos >= 3:
-                            logger.error("Se superó el límite de 3 fallos consecutivos. Forzando cierre y reconexión de BD...")
-                            self._reconnect_db()
-                            fallos_consecutivos = 0
-                        else:
-                            time.sleep(self.update_time)
+    # ─── Entry point ───────────────────────────────────────────────────
 
+    def run(self):
+        logger.info(f"Iniciando captura de telemetria en tabla {self.table_name} (Intervalo: {self.update_time}s)...")
+
+        # Lanzar hilo productor como daemon (muere automáticamente si el principal termina)
+        producer = threading.Thread(
+            target=self._producer_loop,
+            name="SensorProducer",
+            daemon=True
+        )
+        producer.start()
+
+        try:
+            # El hilo principal actúa como consumidor (inserción en BD)
+            self._consumer_loop()
         except KeyboardInterrupt:
             logger.info("Deteniendo captura de telemetria por orden del usuario (Ctrl+C).")
         finally:
+            # Señalizar apagado limpio
+            logger.info("Señalizando apagado a los hilos...")
+            self._stop_event.set()
+            producer.join(timeout=5)
+            logger.info("Cerrando LibreHardwareMonitor...")
             self.pc.Close()
             if self.conn and not self.conn.closed:
                 self.conn.close()
+                logger.info("Conexión con la base de datos cerrada.")
             logger.info("Recursos liberados. Script finalizado.")
+
 
 if __name__ == "__main__":
     app = TelemetryLogger()
