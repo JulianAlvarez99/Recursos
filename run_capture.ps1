@@ -18,4 +18,4 @@ Write-Host "Iniciando captura de telemetria..."
 
 $env:PYTHONIOENCODING = "UTF-8"
 
-& $PythonVenv -X utf8 $CaptureScript *>> "$WorkingDir\service_log.txt"
+& $PythonVenv -X utf8 $CaptureScript

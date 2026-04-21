@@ -28,11 +28,6 @@ file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3
 file_handler.setFormatter(log_formatter)
 logger.addHandler(file_handler)
 
-# Handler para consola (capturado por service_log.txt vía redirección)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-logger.addHandler(console_handler)
-
 load_dotenv()
 
 # Configuración .NET
